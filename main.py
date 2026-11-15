@@ -398,6 +398,7 @@ def _read_pack(data, lookup):
         raise ValueError("unsupported pack version")
     end = len(data) - 20
     if hashlib.sha1(data[:end]).digest() != data[end:]:
+
         raise ValueError("pack checksum mismatch")
     pos = 12
     entries = {}
@@ -798,6 +799,7 @@ def _receive_report(commands, reasons, unpack, sideband, report_status):
         line = f"ng {ref} {reason}\n" if reason else f"ok {ref}\n"
         inner += pkt(_wire(line))
     inner += FLUSH
+
     if sideband:
         return _sideband(inner) + FLUSH
     return inner if report_status else b""
@@ -1198,6 +1200,7 @@ def svc_merge_pull(repo, pull, method="squash"):
     base_tip = _repo_tip(repo, pull["base_ref"])
     if not head_tip or not base_tip:
         return None, 405, "Pull Request is not mergeable"
+
     mb = merge_base(repo, head_tip, base_tip)
     merged_flat, conflict = three_way_merge(repo, mb, head_tip, base_tip)
     if conflict:
@@ -1598,6 +1601,7 @@ def rest_route(method, seg, query, body_bytes, authed, host):
                         "message": _commit_message(repo, oid),
                         "author": {
                             "name": _commit_author_name(repo, oid),
+
                             "date": iso_ts(_commit_ts(repo, oid)),
                         },
                         "committer": {
@@ -1998,6 +2002,7 @@ class _GQLParser:
             if t == "(":
                 depth += 1
             elif t == ")":
+
                 depth -= 1
                 if depth == 0:
                     return
@@ -2398,6 +2403,7 @@ def _resolve_field(type_name, source, name, args, ctx):
         if name == "state":
             return ("MERGED" if pull.get("merged") else
                     "CLOSED" if pull.get("state") == "closed" else "OPEN")
+
         if name == "merged":
             return bool(pull.get("merged"))
         if name == "mergeable":
@@ -2798,6 +2804,7 @@ def mcp_route(body_bytes, authed, req_headers):
         if method == "server/discover":
             result = {
                 "supportedVersions": _MCP_VERSIONS,
+
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "forge", "version": "1.0.0"},
                 "protocolVersion": "2026-07-28",
