@@ -280,6 +280,25 @@ def unflatten(repo, flat):
         return build(root)
 
 
+_commit_info_cache = {}
+
+
+def commit_info(objects, oid):
+    # (tree, parents) of a commit, memoized by oid: object content is
+    # addressed by its hash, so the parsed shape can never go stale.
+    info = _commit_info_cache.get(oid)
+    if info is None:
+        found = objects.get(oid)
+        if found is None or found[0] != "commit":
+            return "", ()
+        parsed = read_commit(found[1])
+        info = (parsed["tree"], tuple(parsed["parents"]))
+        if len(_commit_info_cache) > 16384:
+            _commit_info_cache.clear()
+        _commit_info_cache[oid] = info
+    return info
+
+
 def ancestor_set(objects, tip):
     seen = set()
     stack = [tip]
@@ -291,8 +310,25 @@ def ancestor_set(objects, tip):
         if found is None or found[0] != "commit":
             continue
         seen.add(oid)
-        stack.extend(read_commit(found[1])["parents"])
+        stack.extend(commit_info(objects, oid)[1])
     return seen
+
+
+def is_ancestor(objects, anc, tip):
+    # Early-exit reachability: in the common fast-forward case the old
+    # tip is the new tip's parent, so this answers in a step or two
+    # where ancestor_set would walk (and parse) the whole history.
+    seen = set()
+    stack = [tip]
+    while stack:
+        oid = stack.pop()
+        if oid == anc:
+            return True
+        if oid in seen:
+            continue
+        seen.add(oid)
+        stack.extend(commit_info(objects, oid)[1])
+    return False
 
 
 def history_of(repo, tip):
@@ -326,10 +362,10 @@ def sweep(objects, tips, exclude=frozenset(), stop_commits=frozenset()):
         seen.add(oid)
         kind, data = found
         if kind == "commit":
-            commit = read_commit(data)
-            stack.append(commit["tree"])
+            tree, parents = commit_info(objects, oid)
+            stack.append(tree)
             if oid not in stop_commits:
-                stack.extend(commit["parents"])
+                stack.extend(parents)
         elif kind == "tree":
             for mode, _name, child in read_tree(data):
                 if mode != "160000":
@@ -512,7 +548,7 @@ def _scan_pack(data, end, count):
         elif kind not in KIND_BY_CODE:
             raise ValueError("invalid pack type")
         inflater = zlib.decompressobj()
-        raw = inflater.decompress(data[pos:])
+        raw = inflater.decompress(memoryview(data)[pos:])
         if not inflater.eof:
             raise ValueError("truncated compressed object")
         consumed = len(data) - pos - len(inflater.unused_data)
@@ -542,7 +578,7 @@ def _unpack_inner(data, lookup):
     if version not in (2, 3):
         raise ValueError("unsupported pack version")
     end = len(data) - 20
-    if hashlib.sha1(data[:end]).digest() != data[end:]:
+    if hashlib.sha1(memoryview(data)[:end]).digest() != data[end:]:
         raise ValueError("pack checksum mismatch")
     entries, ordered = _scan_pack(data, end, count)
     objects = {}
@@ -769,7 +805,7 @@ def shallow_pick(objects, wants, depth):
             continue
         generations[oid] = generation
         if generation < depth:
-            for parent in read_commit(found[1])["parents"]:
+            for parent in commit_info(objects, oid)[1]:
                 queue.append((parent, generation + 1))
     commits = set(generations)
     selected = sweep(objects, commits, stop_commits=commits) | direct | tags
@@ -777,7 +813,7 @@ def shallow_pick(objects, wants, depth):
     for oid in generations:
         if generations[oid] != depth:
             continue
-        parents = read_commit(objects[oid][1])["parents"]
+        parents = commit_info(objects, oid)[1]
         if any(parent in objects for parent in parents):
             boundary.add(oid)
     return selected, commits, boundary
@@ -970,7 +1006,7 @@ def _push_reject(staged, refs, old, new, ref):
         old_obj = staged.get(old)
         if old_obj is not None and old_obj[0] == "commit" and staged[new][0] == "commit":
             try:
-                if old not in ancestor_set(staged, new):
+                if not is_ancestor(staged, old, new):
                     return "non-fast-forward"
             except (ValueError, UnicodeError):
                 return "bad object"
@@ -3055,6 +3091,33 @@ def route_mcp(body_bytes, authed, req_headers):
 
 _request_counter = itertools.count(1)
 _BODY_LIMIT = 64 * 1024 * 1024
+_get_cache = {}
+_epoch = [0]
+
+
+_HEADER_NAME_CHARS = frozenset(
+    b"!#$%&'*+-.^_`|~0123456789"
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+class _FastHeaders:
+    """Minimal stand-in for http.client.HTTPMessage covering the .get()
+    lookups this server performs. First occurrence wins, as with
+    HTTPMessage.get, and names match case-insensitively."""
+
+    def __init__(self, pairs):
+        self._pairs = pairs
+
+    def get(self, name, default=None):
+        wanted = name.lower()
+        for key, value in self._pairs:
+            if key == wanted:
+                return value
+        return default
+
+    def __contains__(self, name):
+        wanted = name.lower()
+        return any(key == wanted for key, _value in self._pairs)
 
 
 class ForgeHandler(http.server.BaseHTTPRequestHandler):
@@ -3062,6 +3125,56 @@ class ForgeHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def parse_request(self):
+        # Fast path for the one request shape every client of this
+        # server sends: a three-word HTTP/1.0 or HTTP/1.1 request line
+        # followed by plain "Name: value" header lines. Anything else
+        # falls through to the stock parser untouched (the header block
+        # has not been read yet at that point); a header block that is
+        # not plain is rejected with a 400.
+        line = str(self.raw_requestline, "iso-8859-1").rstrip("\r\n")
+        words = line.split()
+        if len(words) != 3 or words[2] not in ("HTTP/1.1", "HTTP/1.0"):
+            return super().parse_request()
+        pairs = []
+        total = 0
+        while True:
+            raw = self.rfile.readline(65537)
+            if raw in (b"\r\n", b"\n", b""):
+                break
+            total += len(raw)
+            if (len(raw) > 65536 or total > 262144
+                    or not raw.endswith(b"\r\n")
+                    or raw[:1] in (b" ", b"\t")):
+                self.send_error(400, "Bad Request")
+                return False
+            name, sep, value = raw[:-2].partition(b":")
+            if (not sep or not name
+                    or any(c not in _HEADER_NAME_CHARS for c in name)):
+                self.send_error(400, "Bad Request")
+                return False
+            pairs.append((name.decode("ascii").lower(),
+                          value.decode("iso-8859-1").strip(" \t")))
+        self.requestline = line
+        self.command = words[0]
+        path = words[1]
+        if path.startswith("//"):
+            path = "/" + path.lstrip("/")
+        self.path = path
+        self.request_version = words[2]
+        self.headers = _FastHeaders(pairs)
+        self.close_connection = words[2] == "HTTP/1.0"
+        connection = self.headers.get("Connection", "")
+        if connection.lower() == "close":
+            self.close_connection = True
+        elif connection.lower() == "keep-alive" and words[2] == "HTTP/1.0":
+            self.close_connection = False
+        if (words[2] == "HTTP/1.1"
+                and self.headers.get("Expect", "").lower() == "100-continue"):
+            if not self.handle_expect_100():
+                return False
+        return True
 
     def setup(self):
         super().setup()
@@ -3145,6 +3258,8 @@ class ForgeHandler(http.server.BaseHTTPRequestHandler):
         return self.headers.get("Authorization") == "Bearer " + TOKEN
 
     def _handle(self, method):
+        if method != "GET":
+            _epoch[0] += 1
         try:
             self._route(method)
         except Exception:
@@ -3169,6 +3284,22 @@ class ForgeHandler(http.server.BaseHTTPRequestHandler):
             seg = [urllib.parse.unquote(part)
                    for part in path[len("/api/v3"):].split("/")
                    if part != ""]
+            if api_method == "GET" and not query:
+                key = (self._authed(), self.headers.get("Host", ""),
+                       tuple(seg))
+                entry = _get_cache.get(key)
+                if entry is not None and entry[0] == _epoch[0]:
+                    self._send(*entry[1])
+                    return
+                result = route_rest(api_method, seg, query, body,
+                                    self._authed(),
+                                    self.headers.get("Host", ""))
+                if result[0] == 200:
+                    if len(_get_cache) > 512:
+                        _get_cache.clear()
+                    _get_cache[key] = (_epoch[0], result)
+                self._send(*result)
+                return
             self._send(*route_rest(api_method, seg, query, body,
                                    self._authed(),
                                    self.headers.get("Host", "")))
